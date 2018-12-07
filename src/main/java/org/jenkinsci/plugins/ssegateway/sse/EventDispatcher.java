@@ -23,12 +23,21 @@
  */
 package org.jenkinsci.plugins.ssegateway.sse;
 
-import hudson.Extension;
-import hudson.model.User;
-import hudson.util.CopyOnWriteMap;
-import jenkins.model.Jenkins;
-import jenkins.util.HttpSessionListener;
-import net.sf.json.JSONObject;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.Serializable;
+import java.util.Collections;
+import java.util.Map;
+import java.util.Set;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import javax.annotation.Nonnull;
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import javax.servlet.http.HttpSessionEvent;
+
 import org.acegisecurity.Authentication;
 import org.jenkinsci.plugins.pubsub.ChannelSubscriber;
 import org.jenkinsci.plugins.pubsub.EventFilter;
@@ -42,23 +51,13 @@ import org.jenkinsci.plugins.ssegateway.Util;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 
-import javax.annotation.Nonnull;
-import javax.servlet.ServletException;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
-import javax.servlet.http.HttpSessionEvent;
-import java.io.IOException;
-import java.io.PrintWriter;
-import java.io.Serializable;
-import java.util.Collections;
-import java.util.Map;
-import java.util.Queue;
-import java.util.Set;
-import java.util.Timer;
-import java.util.TimerTask;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import hudson.Extension;
+import hudson.model.User;
+import hudson.util.CopyOnWriteMap;
+import jenkins.model.Jenkins;
+import jenkins.util.HttpSessionListener;
+
+import net.sf.json.JSONObject;
 
 /**
  * @author <a href="mailto:tom.fennelly@gmail.com">tom.fennelly@gmail.com</a>
@@ -73,10 +72,16 @@ public abstract class EventDispatcher implements Serializable {
     private final transient PubsubBus bus;
     private final transient Authentication authentication;
     private transient Map<EventFilter, ChannelSubscriber> subscribers = new CopyOnWriteMap.Hash<>();
-    
-    // Lists of events that need to be retried on the next reconnect.
-    private transient Queue<Retry> retryQueue = new ConcurrentLinkedQueue<>();
-    
+
+    private static final int MAX_RETRY_COUNT = 20000; //TODO: reduce back
+    private static final int MAX_RELOAD_COUNT = 20000; //TODO: reduce back
+
+    private int reloadCount = 0;
+    private long creationDate = System.currentTimeMillis();
+    private volatile long lastRetryClear = 0;
+    private volatile long lastHandledRetryTime = 0;
+    private volatile long lastCreatedRetryTime = 0;
+
     public EventDispatcher() {
         this.bus = PubsubBus.getBus();
         User current = getUser();
@@ -118,23 +123,23 @@ public abstract class EventDispatcher implements Serializable {
      */
     public synchronized boolean dispatchEvent(String name, String data) throws IOException, ServletException {
         HttpServletResponse response = getResponse();
-        
+
         if (response == null) {
             // The SSE channel is not connected or is reconnecting after timeout.
             // Event will go to retry queue.
             return false;
         }
-        
+
         if (LOGGER.isLoggable(Level.FINEST)) {
             LOGGER.log(Level.FINEST, String.format("SSE dispatcher %s sending event: %s", this, data));
         }
-        
+
         PrintWriter writer = response.getWriter();
-        
+
         if (writer.checkError()) {
             return false;
         }
-        
+
         if (name != null) {
             writer.write("event: " + name + "\n");
         }
@@ -142,10 +147,10 @@ public abstract class EventDispatcher implements Serializable {
             writer.write("data: " + data + "\n");
         }
         writer.write("\n");
-        
+
         return (!writer.checkError());
     }
-    
+
     public void stop() {
         // override as needed
     }
@@ -184,7 +189,7 @@ public abstract class EventDispatcher implements Serializable {
         } else {
             LOGGER.log(Level.SEVERE, String.format("Invalid SSE subscribe configuration. '%s' not specified.", EventProps.Jenkins.jenkins_channel));
         }
-        
+
         return false;
     }
 
@@ -232,19 +237,6 @@ public abstract class EventDispatcher implements Serializable {
         subscribers.clear();
     }
 
-    private void scheduleRetryQueueProcessing(long delay) {
-        if (delay > 0) {
-            new Timer().schedule(new TimerTask() {
-                @Override
-                public void run() {
-                    processRetries();
-                }
-            }, delay);
-        } else {
-            processRetries();
-        }
-    }
-
     private void publishStateEvent(SSEChannel.Event event, Message additional) {
         // Only publish these events if we're running
         // in a test.
@@ -267,84 +259,86 @@ public abstract class EventDispatcher implements Serializable {
     }
 
     private void dispatchReload() {
-        retryQueue.clear();
+        lastRetryClear = System.currentTimeMillis();
         try {
-            dispatchEvent("reload", null);
+            reloadCount++;
+            if (reloadCount < MAX_RELOAD_COUNT) {
+                dispatchEvent("reload", null);
+            } else {
+                LOGGER.log(Level.SEVERE, "Reached max reload count, exhausted, created at: " + (System.currentTimeMillis() - creationDate) + "ms ago");
+            }
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Unable to send reload event to client.", e);
         }
     }
-    
-    private void addToRetryQueue(@Nonnull Message message) {
-        if (!retryQueue.add(new Retry(message))) {
-            // Unable to add to the queue. Lets just tell the client
-            // that it needs to reload the page.
-            dispatchReload();
-        }
+
+    private void addToRetryQueue(@Nonnull Message message) { addToRetryQueue(new Retry(message, this)); }
+
+    private void addToRetryQueue(Retry retry) {
+        this.lastCreatedRetryTime = Math.max(lastCreatedRetryTime, retry.updateLastUpdateTime());
+        RetryManager.getInstance().add(retry);
     }
 
-    synchronized void processRetries() {
-        Retry retry = retryQueue.peek();
-        
+    public void processRetry(Retry retry) {
+        this.lastHandledRetryTime = Math.max(lastHandledRetryTime, retry.getLastUpdateTime());
+        if (retry.getLastUpdateTime() < lastRetryClear || retry.isExpired()){
+            return;
+        }
+
         try {
-            while (retry != null) {
-                try {
-                    String eventJSON = EventHistoryStore.getChannelEvent(retry.channelName, retry.eventUUID);
+            String eventJSON = EventHistoryStore.getChannelEvent(retry.getChannelName(), retry.getEventUUID());
 
-                    if (eventJSON == null) {
-                        // The event is not in the store. This can be simply because the event has
-                        // not yet arrived at the store and been stored. It might need another
-                        // moment or two to get there.
-                        if (!retry.needsMoreTimeToLandInStore()) {
-                            // Something's gone wrong. The event should be in the store by now. 
-                            // Lets tell the client that it needs to do a full page reload. Not much
-                            // else can be done at this stage.
-                            dispatchReload(); // This clears the queue too.
-                            return;
-                        } else {
-                            // The event should be in the store (not expired, so would not 
-                            // have been deleted). Only explanation is that it has not yet
-                            // landed there. Let's pause the retry process
-                            // for a moment and retry again in the hope that the event
-                            // eventually lands there. Exiting here will schedule a new run
-                            // of this retry process (see finally block below).
-                            return;
-                        }
-                    }
-                    
-                    if (Util.isTestEnv()) {
-                        JSONObject eventJSONObj = JSONObject.fromObject(eventJSON);
-                        eventJSONObj.put(SSEChannel.EventProps.sse_dispatch_retry.name(), "true");
-                        eventJSON = eventJSONObj.toString();
-                    }
-
-                    if (!dispatchEvent(retry.channelName, eventJSON)) {
-                        LOGGER.log(Level.FINE, String.format("Error dispatching retry event to SSE channel. Write failed. Dispatcher %s.", this));
+            if (eventJSON == null) {
+                // The event is not in the store. This can be simply because the event has
+                // not yet arrived at the store and been stored. It might need another
+                // moment or two to get there.
+                if (!retry.needsMoreTimeToLandInStore()) {
+                    // Something's gone wrong. The event should be in the store by now.
+                    // Lets tell the client that it needs to do a full page reload. Not much
+                    // else can be done at this stage.
+                    dispatchReload(); // This clears the queue too.
+                    return;
+                } else {
+                    // The event should be in the store (not expired, so would not
+                    // have been deleted). Only explanation is that it has not yet
+                    // landed there. Let's pause the retry process
+                    // for a moment and retry again in the hope that the event
+                    // eventually lands there. Exiting here will schedule a new run
+                    // of this retry process (see finally block below).
+                    if (retry.incRetryCount() > MAX_RETRY_COUNT){
                         return;
-                    } else if (LOGGER.isLoggable(Level.FINEST)) {
-                        LOGGER.log(Level.FINEST, "Dispatched retry event to SSE channel. Dispatcher {0}. Event {1}.", new Object[] {this, eventJSON});
                     }
-                } catch (Exception e) {
-                    LOGGER.log(Level.FINE, String.format("Error dispatching retry event to SSE channel. Write failed. Dispatcher %s.", this), e);
+                }
+            }
+
+            if (Util.isTestEnv()) {
+                JSONObject eventJSONObj = JSONObject.fromObject(eventJSON);
+                eventJSONObj.put(SSEChannel.EventProps.sse_dispatch_retry.name(), "true");
+                eventJSON = eventJSONObj.toString();
+            }
+
+            if (!dispatchEvent(retry.getChannelName(), eventJSON)) {
+                LOGGER.log(Level.FINE, String.format("Error dispatching retry event to SSE channel. Write failed. Dispatcher %s.", this));
+                if (retry.incRetryCount() > MAX_RETRY_COUNT){
                     return;
                 }
-
-                // Only remove from the queue once successfully dispatched.
-                retryQueue.remove();
-                retry = retryQueue.peek();
+            } else if (LOGGER.isLoggable(Level.FINEST)) {
+                LOGGER.log(Level.FINEST, "Dispatched retry event to SSE channel. Dispatcher {0}. Event {1}.", new Object[] {this, eventJSON});
             }
-
-        } finally {
-            if (!retryQueue.isEmpty()) {
-                // For some reason the processing has exited prematurely.
-                // Schedule it to run again. We must clear this ASAP.
-                scheduleRetryQueueProcessing(100);
+        } catch (Exception e) {
+            LOGGER.log(Level.FINE, String.format("Error dispatching retry event to SSE channel. Write failed. Dispatcher %s.", this), e);
+            if (retry.incRetryCount() > MAX_RETRY_COUNT){
+                return;
             }
         }
+
+        addToRetryQueue(retry);
     }
 
+    public long getCreationDate() { return creationDate; }
+
     private void doDispatch(@Nonnull Message message) {
-        if (!retryQueue.isEmpty()) {
+        if (lastCreatedRetryTime > lastHandledRetryTime) {
             // We do not attempt to dispatch events directly
             // while there are events sitting in the retryQueue.
             // The retryQueue must be empty.
@@ -376,7 +370,7 @@ public abstract class EventDispatcher implements Serializable {
             doDispatch(message);
         }
     }
-    
+
     /**
      * Http session listener.
      */
@@ -402,29 +396,6 @@ public abstract class EventDispatcher implements Serializable {
             }
         }
     }
-    
-    private static class Retry {
-        private final long timestamp = System.currentTimeMillis();
-        private final String channelName;
-        private final String eventUUID;
 
-        private Retry(@Nonnull Message message) {
-            // We want to keep the memory footprint of the retryQueue
-            // to a minimum. That is why we are interning these strings
-            // (multiple dispatchers will likely be retrying the same messages)
-            // as well as saving the actual message bodies to file and reading those
-            // back when it comes time to process the retry i.e. keep as little
-            // in memory as possible + share references where we can.
-            this.channelName = message.getChannelName().intern();
-            this.eventUUID = message.getEventUUID().intern();
-        }
-        
-        private boolean needsMoreTimeToLandInStore() {
-            // There's no way it should take more than 10 seconds for
-            // event to hit the store (10 seconds longer than it took to
-            // hit the dispatcher). Once we go outside that window,
-            // then we return false from this function.
-            return (System.currentTimeMillis() - timestamp < 10000);
-        }
-    }
+
 }

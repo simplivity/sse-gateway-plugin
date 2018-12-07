@@ -23,22 +23,25 @@
  */
 package org.jenkinsci.plugins.ssegateway.sse;
 
-import hudson.security.csrf.CrumbIssuer;
-import jenkins.model.Jenkins;
-import net.sf.json.JSONObject;
-import org.jenkinsci.plugins.ssegateway.Util;
-import org.kohsuke.accmod.Restricted;
-import org.kohsuke.accmod.restrictions.NoExternalUse;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 import javax.annotation.CheckForNull;
 import javax.annotation.Nonnull;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import javax.servlet.http.HttpSession;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+
+import org.jenkinsci.plugins.ssegateway.Util;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+
+import hudson.security.csrf.CrumbIssuer;
+import jenkins.model.Jenkins;
+
+import net.sf.json.JSONObject;
 
 /**
  * @author <a href="mailto:tom.fennelly@gmail.com">tom.fennelly@gmail.com</a>
@@ -49,9 +52,9 @@ public class EventDispatcherFactory {
     private static final Logger LOGGER = Logger.getLogger(EventDispatcherFactory.class.getName());
 
     public static final String DISPATCHER_SESSION_KEY = EventDispatcher.class.getName();
-    
+
     private static Class<? extends EventDispatcher> runtimeClass;
-    
+
     static {
         try {
             if (isAsyncSupported()) {
@@ -63,19 +66,19 @@ public class EventDispatcherFactory {
             throw new IllegalStateException("Unexpected Exception.", e);
         }
     }
-    
+
     public static EventDispatcher start(@Nonnull String clientId, @Nonnull HttpServletRequest request, @Nonnull HttpServletResponse response) {
         try {
             HttpSession session = request.getSession();
             EventDispatcher dispatcher = EventDispatcherFactory.getDispatcher(clientId, session);
-            
+
             if (dispatcher == null) {
                 LOGGER.log(Level.FINE, String.format("Unknown dispatcher client Id '%s' on HTTP session '%s'. Creating a new one. " +
                         "Make sure you are calling 'connect' before 'listen' and that HTTP sessions are being maintained between 'connect' and 'configure' calls. " +
                         "SSE client reconnects will not work - probably fine if running in non-browser/test mode.", clientId, session.getId()));
                 dispatcher = EventDispatcherFactory.newDispatcher(clientId, session);
             }
-            
+
             dispatcher.start(request, response);
             dispatcher.setDefaultHeaders();
 
@@ -83,11 +86,11 @@ public class EventDispatcherFactory {
 
             openData.put("dispatcherId", dispatcher.getId());
             openData.put("dispatcherInst", System.identityHashCode(dispatcher));
-            
+
             if (Util.isTestEnv()) {
                 openData.putAll(Util.getSessionInfo(session));
 
-                // Crumb needed for testing because we use it to fire off some 
+                // Crumb needed for testing because we use it to fire off some
                 // test builds via the POST API.
                 Jenkins jenkins = Jenkins.getInstance();
                 CrumbIssuer crumbIssuer = jenkins.getCrumbIssuer();
@@ -100,12 +103,9 @@ public class EventDispatcherFactory {
                     LOGGER.log(Level.WARNING, "No CrumbIssuer on Jenkins instance. Some POSTs might not work.");
                 }
             }
-            
+
             dispatcher.dispatchEvent("open", openData.toString());
-            
-            // Run the retry process in case this is a reconnect.
-            dispatcher.processRetries();
-            
+
             return dispatcher;
         } catch (Exception e) {
             throw new IllegalStateException("Unexpected Exception.", e);
@@ -114,7 +114,7 @@ public class EventDispatcherFactory {
 
     /**
      * Get the session {@link EventDispatcher}s from the {@link HttpSession}.
-     *     
+     *
      * @param session The {@link HttpSession}.
      * @return The session {@link EventDispatcher}s.
      */
@@ -129,7 +129,7 @@ public class EventDispatcherFactory {
 
     /**
      * Create a new {@link EventDispatcher} instance and attach it to the user session. 
-     *     
+     *
      * @param clientId The dispatcher client Id.
      * @param session The {@link HttpSession}.
      * @return The new {@link EventDispatcher} instance.
@@ -166,7 +166,7 @@ public class EventDispatcherFactory {
         if (asyncSupportedProp != null) {
             return asyncSupportedProp.equals("true");
         }
-        
+
         try {
             HttpServletRequest.class.getMethod("startAsync");
             return true;
