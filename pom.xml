@@ -9,7 +9,7 @@
     <relativePath />
   </parent>
   <artifactId>sse-gateway</artifactId>
-  <version>1.17</version>
+  <version>1.17-svt1</version>
   <packaging>hpi</packaging>
 
   <properties>
@@ -63,7 +63,7 @@
       <artifactId>pubsub-light</artifactId>
       <version>1.6</version>
     </dependency>
-    
+
     <!-- Test deps -->
     <dependency>
       <groupId>org.mockito</groupId>
@@ -95,5 +95,5 @@
         </plugin>
     </plugins>
   </build>
-  
+
 </project>
